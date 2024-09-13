@@ -220,7 +220,7 @@ def main():
   
         'RF': {
             'n_estimators': np.arange(10,100, 10),
-            'max_depth': np.arange(1,7,1),
+            'max_depth': np.arange(2,7,1),
             'min_samples_split': np.arange(2,5,1),
             'random_state': [0]
         }}
