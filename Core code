@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import lightgbm as lgb
+from catboost import CatBoostRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV, KFold, cross_val_score
+from datetime import datetime
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class CNNFeatureExtractor(nn.Module):
+    def __init__(self, input_dim, num_features):
+        super(CNNFeatureExtractor, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=64, kernel_size=2)
+        self.pool = nn.MaxPool1d(kernel_size=2)
+        self.flatten = nn.Flatten()
+        conv_output_dim = (input_dim - 2 + 1) // 2
+        self.fc1 = nn.Linear(64 * conv_output_dim, 100)
+        self.fc2 = nn.Linear(100, num_features)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.flatten(x)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+def extract_features_with_cnn(data, cnn_model, device, seed=7):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    data_tensor = torch.tensor(data.values, dtype=torch.float32).unsqueeze(1).to(device)
+    cnn_model.eval()
+    with torch.no_grad():
+        new_features = cnn_model(data_tensor).cpu().numpy()
+    new_feature_columns = [f'cnn_feature_{i}' for i in range(new_features.shape[1])]
+    new_features_df = pd.DataFrame(new_features, columns=new_feature_columns)
+    return new_features_df
+
+
+def train_and_evaluate_models(train_data, sh_name, params):
+    X_df = train_data[[col for col in train_data.columns if col != sh_name]]
+    y = train_data[[sh_name]]    
+    X = X_df.values
+    y = y.values 
+    models = {
+        'XGB': xgb.XGBRegressor(),
+        'LGBM': lgb.LGBMRegressor(),
+        'CatBoost': CatBoostRegressor(verbose=0),
+        'RF': RandomForestRegressor()
+    }
+    params = params
+    best_model = None
+    best_score = -np.inf
+    best_model_name = ""
+    kfold = KFold(n_splits=10, shuffle=True, random_state=7)
+    for model_name, model in models.items():
+        grid_search = GridSearchCV(estimator=model, param_grid=params[model_name], scoring='r2', cv=kfold, n_jobs=4)
+        grid_search.fit(X, y.ravel())
+        mean_score = grid_search.best_score_
+        if mean_score > best_score:
+            best_model = grid_search.best_estimator_
+            best_model_params = grid_search.best_params_
+    parameters_df = pd.DataFrame([{'Params': str(best_model_params),  'Area': sh_name}])    
+    return best_model, parameters_df
+
+
+def train_and_evaluate_models_cnn(train_data, sh_name, params):
+    X_df = train_data[[col for col in train_data.columns if col != sh_name]]
+    y = train_data[[sh_name]]     
+    X = X_df.values
+    y = y.values 
+    models = {
+        'XGB': xgb.XGBRegressor(),
+        'LGBM': lgb.LGBMRegressor(),
+        'CatBoost': CatBoostRegressor(verbose=0),
+        'RF': RandomForestRegressor()
+    }
+    params = params
+    best_model = None
+    best_score = -np.inf
+    best_model_name = ""
+    kfold = KFold(n_splits=10, shuffle=True, random_state=4)
+    for model_name, model in models.items():
+        grid_search = GridSearchCV(estimator=model, param_grid=params[model_name], scoring='r2', cv=kfold, n_jobs=4)
+        grid_search.fit(X, y.ravel())
+        mean_score = grid_search.best_score_
+
+        if mean_score > best_score:
+            best_score = mean_score
+            best_model = grid_search.best_estimator_
+            best_model_name = model_name
+    return best_model
+
+
+def evaluate_model(Dataname, model, X, y, val_data_res, sh_name, Algo):
+    predictions = model.predict(X)
+    val_data_res[sh_name + '_act'] = pd.Series(y.flatten())
+    val_data_res[sh_name + '_pre'] = pd.Series(predictions.flatten())
+
+    evaluator = RegressionMetric(y, predictions)
+    MAE = evaluator.mean_absolute_error()
+    RMSE = evaluator.root_mean_squared_error()
+    MRE = evaluator.mean_relative_error()
+    R2 = evaluator.coefficient_of_determination()
+
+    print('##############################################')
+    print(Algo + ' Test-{}-model\nMAE={}\nRMSE={}\nMRE={}\nR2={}'.format(Dataname, MAE, RMSE, MRE, R2))
+    print('##############################################')
+
+    indicators_df = pd.DataFrame({
+        'Species': [sh_name],
+        'MAE': [MAE],
+        'RMSE': [RMSE],
+        'MRE': [MRE],
+        'R2': [R2]
+    })
+    return indicators_df
+
+
+def calculate_time_difference(time1_str, time2_str, time_format='%Y-%m-%d %H:%M:%S'):
+    time1 = datetime.strptime(time1_str, time_format)
+    time2 = datetime.strptime(time2_str, time_format)
+    time_difference = time2 - time1
+    total_seconds = time_difference.total_seconds()
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"THIS TURN: {int(hours)}h {int(minutes)}min {int(seconds)}s"
+
+
+def evaluate_features_num(features_num_list, train_data, sh_name, params, device):
+    results = []
+    best_score = -np.inf
+    best_num_features = None
+    best_new_features_train = None
+    for num_features in features_num_list:
+        cnn_model = CNNFeatureExtractor(train_data.shape[1] - 1, num_features).to(device)        
+        new_features_train = extract_features_with_cnn(train_data.iloc[:, 1:], cnn_model, device, seed=7)
+        new_features_train.index = train_data.index
+        train_data_with_new_features = pd.concat([train_data, new_features_train], axis=1)        
+        best_model = train_and_evaluate_models_cnn(train_data_with_new_features, sh_name, params)        
+        X = train_data_with_new_features[[col for col in train_data_with_new_features.columns if col != sh_name]].values
+        y = train_data_with_new_features[sh_name].values.ravel()
+        kfold = KFold(n_splits=10, shuffle=True, random_state=7)
+        scores = cross_val_score(best_model, X, y, cv=kfold, scoring='r2')        
+        mean_score = scores.mean()
+        std_score = scores.std()
+        results.append((num_features, mean_score, std_score))
+        
+        if mean_score > best_score:
+            best_score = mean_score
+            best_num_features = num_features
+            best_new_features_train = new_features_train
+    
+    return results, best_num_features, best_new_features_train
+
+
+def find_least_important_features(train_data, sh_name, params, num_features):
+    X_df = train_data[[col for col in train_data.columns if col != sh_name]]
+    y = train_data[[sh_name]]
+    X = X_df.values
+    y = y.values
+    models = {
+        'XGB': xgb.XGBRegressor(),
+        'LGBM': lgb.LGBMRegressor(),
+        'CatBoost': CatBoostRegressor(verbose=0),
+        'RF': RandomForestRegressor()
+    }
+    params = params
+    best_model = None
+    best_score = -np.inf
+    kfold = KFold(n_splits=10, shuffle=True, random_state=7)
+
+    for model_name, model in models.items():
+        grid_search = GridSearchCV(estimator=model, param_grid=params[model_name], scoring='r2', cv=kfold, n_jobs=4)
+        grid_search.fit(X, y.ravel())
+        mean_score = grid_search.best_score_
+
+        if mean_score > best_score:
+            best_score = mean_score
+            best_model = grid_search.best_estimator_
+    best_model.fit(X, y)
+    feature_importances = best_model.feature_importances_
+    feature_names = X_df.columns
+    least_important_features = feature_names[np.argsort(feature_importances)[:num_features]]
+    
+    return least_important_features
+
+
+def main():
+    all_parameters_df = pd.DataFrame()
+    all_indicators_df_YMK = pd.DataFrame()
+    all_indicators_df_out = pd.DataFrame()
+    val_data_res_main = pd.DataFrame()
+    val_data_res_2020 = pd.DataFrame()
+    val_data_res_YMK = pd.DataFrame()
+    Modelsavepath = ''
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    params = {
+        'XGB': {
+                 'learning_rate': np.arange(0.01,0.05,0.01),
+                 'n_estimators': range(700,1350, 50),
+                 'max_depth': np.arange(2,7,1),
+                 'min_child_weight': np.arange(2,5,1)
+        },   
+        
+        'LGBM': {
+                 'learning_rate': np.arange(0.01,0.05,0.01),
+                 'max_depth': range(2,7,1),             
+                 'n_estimators': range(700, 1350, 50),
+                 'num_leaves':range(10, 150, 10), 
+        },
+        
+        'CatBoost': {
+            'learning_rate': np.arange(0.01,0.05,0.01),
+            'iterations':range(700,1350,50),  
+        },
+  
+        'RF': {
+            'n_estimators': np.arange(10,100, 10),
+            'max_depth': np.arange(1,7,1),
+            'min_samples_split': np.arange(2,5,1),
+            'random_state': [0]
+        }}
+    
+    features_num_list = [2,3,4,5]
+    best_score = -np.inf
+    least_important_features_dict = {}  
+    
+    for column in Yvar.columns:
+        time1 = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f'{column} Start:{time1}')
+        Traindata = Xvar.copy()
+        Traindata.insert(0, column, Yvar[column])        
+        least_important_features = find_least_important_features(Traindata, column, params, 5)
+        least_important_features_dict[column] = least_important_features      
+        Traindata = Traindata.drop(columns=least_important_features) 
+        results, best_num_features, best_new_features_train = evaluate_features_num(features_num_list, Traindata, column, params, device)
+        for num_features, mean_score, std_score in results:
+            print(f'Features: {num_features}, R2: {mean_score:.4f}, Std: {std_score:.4f}')
+            if mean_score > best_score:
+                best_num_features = num_features
+                best_score = mean_score
+        cnn_model = CNNFeatureExtractor(Xvar.shape[1], best_num_features).to(device)
+
+        sh_name = column 
+        Traindata = pd.concat([Traindata, best_new_features_train], axis=1)     
+        Xvar_YMK = XY_YMK_data[Other_compounds].copy() 
+        
+        if column in list(Yvar.columns):
+            new_features_YMK = extract_features_with_cnn(Xvar_YMK, cnn_model, device, seed=7)
+            new_features_YMK.index = Xvar_YMK.index
+            Xvar_YMK = XY_YMK_data[Other_compounds].copy().drop(columns=least_important_features) 
+            Xvar_YMK = pd.concat([Xvar_YMK, new_features_YMK], axis=1) 
+            
+        data_within_range = Traindata[(Traindata.index >= '2020-09-01') & (Traindata.index <= '2021-01-01')]
+        shuffled_data = data_within_range.sample(frac=1, random_state=7)
+        half_point = len(shuffled_data) // 2
+        Test_2020_data = shuffled_data[:half_point]
+        Train_within_range = shuffled_data[half_point:]
+        Train_after_2021 = Traindata[Traindata.index > '2021-01-01']
+        Train_2023_data = pd.concat([Train_within_range, Train_after_2021])  
+        best_model, parameters_df = train_and_evaluate_models(Train_2023_data, sh_name, params)
+        if column in list(Yvar_YMK):
+            indicators_df_YMK = evaluate_model('YMK', best_model, Xvar_YMK.values, Yvar_YMK[[sh_name]].values, val_data_res_YMK, sh_name, Algo)
+            all_indicators_df_YMK = pd.concat([all_indicators_df_YMK, indicators_df_YMK], ignore_index=True)
+        else:
+            print('##############################################')
+            print(f' Test-YMK-Not: {sh_name}，Skip...')
+            print('##############################################') 
+        indicators_df_out = evaluate_model('PKU', best_model, Test_2020_data.iloc[:, 1:].values, Test_2020_data.iloc[:, 0:1].values, val_data_res_2020, sh_name, Algo)
+        all_indicators_df_out = pd.concat([all_indicators_df_out, indicators_df_out], ignore_index=True)
+
+        time2 = datetime.now().strftime('%Y-%m-%d %H:%M:%S') 
+        print(f'{column} End:{time2}')
+        print(calculate_time_difference(time1, time2))
+
+
+if __name__ == "__main__":
+    main()
